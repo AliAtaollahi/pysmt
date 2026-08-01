@@ -168,12 +168,20 @@ combinations. The following solvers are supported through native APIs:
 * MathSAT (http://mathsat.fbk.eu/)
 * Z3 (https://github.com/Z3Prover/z3/)
 * cvc5 (https://cvc5.github.io/)
+* Bitwuzla (https://bitwuzla.github.io/)
 * Yices 2 (http://yices.csl.sri.com/)
 * CUDD (http://vlsi.colorado.edu/~fabio/CUDD/)
 * PicoSAT (http://fmv.jku.at/picosat/)
 * Boolector (http://fmv.jku.at/boolector/)
 
-Additionally, you can use any SMT-LIB 2 compliant solver.
+SMTInterpol is supported through its SMT-LIB subprocess interface, including
+Craig and sequence interpolation. Additionally, you can use any SMT-LIB 2
+compliant solver.
+
+The SMTInterpol adapter requires Java and a standalone jar. Set
+``PYSMT_SMTINTERPOL_JAR`` to that jar, place it under
+``~/.smt_solvers/smtinterpol/``, or build the sibling
+``solvers/smtinterpol`` checkout with ``ant smtinterpol.jar``.
 
 PySMT assumes that the python bindings for the SMT Solver are
 installed and accessible from your ``PYTHONPATH``.
@@ -239,7 +247,11 @@ each of the available solvers.
  +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+
  | Z3               |  z3       | UF, LIA, LRA, BV, AX, NRA, NIA |  Yes        | z3                     | Yes        | No           |
  +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+
- | cvc5             |  cvc5     | UF, LIA, LRA, BV, AX, S        |  Yes        | No                     | No         | No           |
+ | cvc5             |  cvc5     | UF, LIA, LRA, BV, AX, S        |  Yes        | No                     | No         | Yes          |
+ +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+
+ | Bitwuzla         | bitwuzla  | UF, BV, AX                     |  No         | No                     | No         | Yes          |
+ +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+
+ | SMTInterpol      |smtinterpol| UF, LIA, LRA, AX               |  No         | No                     | No         | Yes          |
  +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+
  | Yices            |  yices    | UF, LIA, LRA, BV               |  No         | No                     | No         | No           |
  +------------------+-----------+--------------------------------+-------------+------------------------+------------+--------------+

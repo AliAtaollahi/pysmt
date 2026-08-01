@@ -19,6 +19,7 @@ solver. Moreover, pySMT can leverage the API of the following solvers:
 * MathSAT (http://mathsat.fbk.eu/)
 * Z3 (https://github.com/Z3Prover/z3/)
 * cvc5 (https://cvc5.github.io/)
+* Bitwuzla (https://bitwuzla.github.io/)
 * Yices 2 (http://yices.csl.sri.com/)
 * CUDD (http://vlsi.colorado.edu/~fabio/CUDD/)
 * PicoSAT (http://fmv.jku.at/picosat/)
@@ -199,9 +200,9 @@ solvers. In our example, we can specify which solver we want to run by
 changing the way we instantiate it. If any other solver is installed,
 you can try it by simply changing ``name="z3"`` to its codename (e.g., ``msat``):
 
-=========   ==========
-Solver      pySMT name
-=========   ==========
+===========   ===========
+Solver        pySMT name
+===========   ===========
 MathSAT     msat
 Z3          z3
 cvc5        cvc5
@@ -209,7 +210,9 @@ Yices       yices
 Boolector   btor
 Picosat     picosat
 CUDD        bdd
-=========   ==========
+Bitwuzla    bitwuzla
+SMTInterpol smtinterpol
+===========   ===========
 
 You can also not specify the solver, and simply state which Logic must
 be supported by the solver, this will look into the installed solvers

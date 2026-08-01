@@ -21,7 +21,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union, 
 
 from pysmt.constants import Fraction, is_pysmt_fraction, is_pysmt_integer
 
-from pysmt.logics import Logic, LRA, LIA, QF_UFLIA, QF_UFLRA, QF_BV, PYSMT_QF_LOGICS
+from pysmt.logics import (
+    Logic, LRA, LIA, QF_UFLIA, QF_UFLRA, QF_BV, QF_ABV, PYSMT_QF_LOGICS,
+    get_logic_by_name,
+)
 from pysmt.oracles import get_logic
 
 from pysmt.solvers.dynmsat import MSATLibLoader, MSATCreateEnv, MSATCreateConverter
@@ -1211,7 +1214,16 @@ class MSatInterpolator(Interpolator):
 
     __lib_name__ = "mathsat"
 
-    LOGICS = [QF_UFLIA, QF_UFLRA, QF_BV]
+    # QF_ABV added (plain and the array-of-constants variant, "QF_ABV*" --
+    # MoXI's array-initialization idiom, `(as const (Array ...)) default`,
+    # is detected as this stricter logic, not plain QF_ABV). A raw msat C
+    # API probe confirmed MathSAT's proof-producing (non-eager) BV solver
+    # does interpolate concrete QF_ABV formulas -- upstream's LOGICS list
+    # here was simply never updated after `theory.bv.eager` support was
+    # added for BV logics (see the eager-BV-disable fix below, which had the
+    # matching bug: gated on `logic == QF_BV` exactly, so QF_ABV never got a
+    # proof-producing solver either).
+    LOGICS = [QF_UFLIA, QF_UFLRA, QF_BV, QF_ABV, get_logic_by_name("QF_ABV*")]
 
     def __init__(self, environment, logic=None):
         Interpolator.__init__(self)
@@ -1249,7 +1261,12 @@ class MSatInterpolator(Interpolator):
 
             cfg = self._msat_lib.msat_create_config()
             self._msat_lib.msat_set_option(cfg, "interpolation", "true")
-            if self.logic == QF_BV:
+            # The eager (bit-blasting) BV solver does not produce the proof
+            # MathSAT's interpolation needs; every BV-containing logic hits
+            # this, not just QF_BV exactly -- QF_ABV (arrays over BV) used to
+            # fall through this check and get "eager bv solver does not
+            # support proof generation" from MathSAT on every attempt.
+            if getattr(self.logic, "theory", None) is not None and self.logic.theory.bit_vectors:
                 self._msat_lib.msat_set_option(cfg, "theory.bv.eager", "false")
                 self._msat_lib.msat_set_option(cfg, "theory.eq_propagaion", "false")
             env = self._do_create_env(cfg, self.msat_env())
@@ -1273,6 +1290,20 @@ class MSatInterpolator(Interpolator):
             pysmt_ret = []
             for i in range(1, len(groups)):
                 itp = self._msat_lib.msat_get_interpolant(env, groups[:i])
+                # msat_get_interpolant reports failure by returning
+                # MSAT_ERROR_TERM -- it does not raise. That term wraps a NULL
+                # pointer, so handing it to the converter segfaults the
+                # process inside msat_term_arity (verified directly against
+                # the bindings). MathSAT can decide a query UNSAT and still
+                # fail to build the interpolant for it, which is exactly what
+                # happens on the QF_ABV benchmarks, so this is a reachable
+                # path and not a defensive check.
+                #
+                # None is pySMT's documented "no interpolant" return, and the
+                # engines already treat it as inconclusive -> UNKNOWN, never
+                # as a verdict.
+                if self._msat_lib.MSAT_ERROR_TERM(itp):
+                    return None
                 f = self.converter.back(itp)
                 pysmt_ret.append(f)
 

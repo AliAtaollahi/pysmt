@@ -1,2 +1,7 @@
 *.pyc
 *~
+
+# SMTInterpol is a Java jar built from its own source tree, not a Python
+# binding -- like the CVC5/Bitwuzla wheels it is installed, never committed.
+# pysmt/solvers/smtinterpol.py finds it here, or via PYSMT_SMTINTERPOL_JAR.
+/smtinterpol/

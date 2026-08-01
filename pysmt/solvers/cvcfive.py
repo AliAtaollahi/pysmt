@@ -30,13 +30,29 @@ except ImportError:
 from cvc5 import Kind # type: ignore[import]
 
 import pysmt.typing as types
-from pysmt.logics import PYSMT_LOGICS, AUFLIRA, AUFLIA, AUFNIRA, ALIA
+from pysmt.logics import (PYSMT_LOGICS, AUFLIRA, AUFLIA, AUFNIRA, ALIA,
+                          QF_ABV, QF_AUFBV, QF_BV, QF_LIA, QF_LRA, QF_NIA,
+                          QF_NRA, QF_UFBV)
+from pysmt.oracles import get_logic
 
 from pysmt.solvers.solver import Solver, Converter, SolverOptions
 from pysmt.exceptions import (SolverReturnedUnknownResultError,
                               InternalSolverError,
                               PysmtValueError,
                               PysmtTypeError)
+from pysmt.solvers._array_rewriter import (expand_array_equalities,
+                                           make_array_expander)
+from pysmt.solvers._smtlib_bridge import (collect_symbols,
+                                          declaration_script,
+                                          integer_to_decimal,
+                                          make_renamer,
+                                          make_safe_symbol_map,
+                                          node_to_smtlib,
+                                          normalize_logic_name,
+                                          repair_quoted_symbols,
+                                          rename_symbols,
+                                          term_to_pysmt, terms_to_pysmt)
+from pysmt.solvers.interpolation import Interpolator
 from pysmt.walkers import DagWalker
 from pysmt.solvers.smtlib import SmtLibBasicSolver, SmtLibIgnoreMixin
 from pysmt.solvers.eager import EagerModel
@@ -140,6 +156,17 @@ class CVC5Solver(SmtLibBasicSolver):
         self.options(self)
 
         self.converter = CVC5Converter(environment, parent_solver=self)
+        # cvc5's array solver refuses write-chains connecting two different
+        # constant arrays; stating such equalities elementwise avoids the
+        # unsupported shape without changing what is being asked.
+        self._array_expander = make_array_expander(environment)
+
+    def _expand_arrays(self, formula: FNode) -> FNode:
+        return expand_array_equalities(
+            formula,
+            self.environment,
+            self._array_expander,
+        )
 
     def reset_assertions(self):
         self.cvc5_solver.resetAssertions()
@@ -149,7 +176,7 @@ class CVC5Solver(SmtLibBasicSolver):
 
     def add_assertion(self, formula: FNode, named: Optional[str]=None):
         self._assert_is_boolean(formula)
-        term = self.converter.convert(formula)
+        term = self.converter.convert(self._expand_arrays(formula))
         self.cvc5_solver.assertFormula(term)
 
     def get_model(self):
@@ -163,7 +190,10 @@ class CVC5Solver(SmtLibBasicSolver):
 
     def solve(self, assumptions: Optional[Iterable[FNode]]=None) -> bool:
         if assumptions is not None:
-            cvc5_assumptions = [self.converter.convert(a) for a in assumptions]
+            cvc5_assumptions = [
+                self.converter.convert(self._expand_arrays(a))
+                for a in assumptions
+            ]
             res = self.cvc5_solver.checkSatAssuming(*cvc5_assumptions)
         else:
             try:
@@ -214,7 +244,26 @@ class CVC5Solver(SmtLibBasicSolver):
         return res
 
     def _exit(self):
+        # DagWalker stores bound methods in ``functions``, so the converter
+        # forms a reference cycle with itself. It also points back to this
+        # solver and caches native Terms in ``memoization`` and
+        # ``declared_vars``. Merely deleting ``self.converter`` therefore
+        # leaves those Terms for cyclic garbage collection, which can happen
+        # after the native Solver has already been destroyed and segfault in
+        # the cvc5 bindings. Break the cycle and release every native object
+        # deterministically while its Solver is still alive.
+        self.converter.memoization.clear()
+        self.converter.stack.clear()
+        self.converter.declared_vars.clear()
+        self.converter.functions.clear()
+        self.converter.parent_solver = None
+        del self.converter
         del self.cvc5_solver
+
+    def exit(self):
+        # SmtLibIgnoreMixin.exit() intentionally ignores an SMT-LIB ``exit``
+        # command, but native cvc5 contexts still need deterministic cleanup.
+        Solver.exit(self)
 
 
     def set_option(self, name, value):
@@ -326,12 +375,12 @@ class CVC5Converter(Converter, DagWalker):
     def walk_real_constant(self, formula, **kwargs):
         frac = formula.constant_value()
         n,d = frac.numerator, frac.denominator
-        rep = str(n) + "/" + str(d)
+        rep = integer_to_decimal(n) + "/" + integer_to_decimal(d)
         return self.cvc5_solver.mkReal(rep)
 
     def walk_int_constant(self, formula: FNode, **kwargs) -> cvc5.Term:
         assert is_pysmt_integer(formula.constant_value())
-        rep = str(formula.constant_value())
+        rep = integer_to_decimal(formula.constant_value())
         return self.cvc5_solver.mkInteger(rep)
 
     def walk_bool_constant(self, formula: FNode, **kwargs) -> cvc5.Term:
@@ -594,3 +643,258 @@ class CVC5Converter(Converter, DagWalker):
         old_var_list = [self.walk_symbol(x, []) for x in variables]
         new_formula = formula.substitute(old_var_list, new_var_list)
         return (new_formula, new_var_list)
+
+
+class CVC5Interpolator(Interpolator):
+    """Craig and inductive-sequence interpolation backed by cvc5."""
+
+    LOGICS = [QF_BV, QF_UFBV, QF_ABV, QF_AUFBV,
+              QF_LIA, QF_NIA, QF_LRA, QF_NRA]
+
+    def __init__(self, environment: Environment, logic=None):
+        Interpolator.__init__(self)
+        self.environment = environment
+        self.logic = logic
+        self.mode = "default"
+
+    def _check_logic(self, formulas):
+        for formula in formulas:
+            detected = get_logic(formula, self.environment)
+            if not any(detected <= supported for supported in self.LOGICS):
+                raise PysmtValueError(
+                    "Logic not supported by cvc5 interpolation. "
+                    "(detected logic is: %s)" % detected
+                )
+
+    def _context(self):
+        solver = cvc5.Solver()
+        solver.setOption("arrays-exp", "true")
+        solver.setOption("incremental", "true")
+        solver.setOption("produce-interpolants", "true")
+        solver.setOption("interpolants-mode", self.mode)
+        solver.setLogic(normalize_logic_name(self.logic))
+        return solver, cvc5.SymbolManager(solver)
+
+    def _run_commands(self, solver, symbol_manager, script, name):
+        if not script:
+            return
+        parser = cvc5.InputParser(solver, symbol_manager)
+        parser.setStringInput(
+            cvc5.InputLanguage.SMT_LIB_2_6,
+            repair_quoted_symbols(script),
+            name,
+        )
+        while True:
+            command = parser.nextCommand()
+            if command.isNull():
+                break
+            command.invoke(solver, symbol_manager)
+
+    def _parse_term(self, solver, symbol_manager, formula):
+        parser = cvc5.InputParser(solver, symbol_manager)
+        parser.setStringInput(
+            cvc5.InputLanguage.SMT_LIB_2_6,
+            node_to_smtlib(formula),
+            "term",
+        )
+        if hasattr(parser, "nextTerm"):
+            term = parser.nextTerm()
+        else:
+            term = parser.nextExpression()
+        if term.isNull():
+            raise InternalSolverError("cvc5 parser returned a null term")
+        return term
+
+    def _prepare(self, formulas):
+        """Rename to safe identifiers and build the declaration script once.
+
+        Collecting the symbols and serializing their declarations is
+        proportional to the size of the whole unrolling, and both used to be
+        redone for every interpolant of a sequence. The renamer is shared too:
+        the blocks of one sequence overlap almost entirely.
+        """
+        # Equalities over constant arrays are unsupported by cvc5's array
+        # solver; the elementwise form is equivalent and adds no symbols, so
+        # the interpolant needs no translation back.
+        expander = make_array_expander(self.environment)
+        formulas = [
+            expand_array_equalities(formula, self.environment, expander)
+            for formula in formulas
+        ]
+        symbols = collect_symbols(formulas)
+        symbol_map = make_safe_symbol_map(
+            formulas,
+            self.environment,
+            "cvc5_itp",
+            symbols=symbols,
+        )
+        renamer = make_renamer(symbol_map, self.environment)
+        native_formulas = [
+            rename_symbols(formula, symbol_map, self.environment, renamer)
+            for formula in formulas
+        ]
+        # Renaming is injective and total over the collected symbols, so this
+        # matches collecting from the renamed formulas.
+        native_symbols = sorted(
+            (symbol_map[symbol] for symbol in symbols),
+            key=lambda symbol: symbol.symbol_name(),
+        )
+        declarations, native_symbols = declaration_script(
+            native_formulas,
+            symbols=native_symbols,
+        )
+        return symbol_map, native_formulas, declarations, native_symbols
+
+    def _back(self, term, declarations, symbols, symbol_map):
+        return term_to_pysmt(
+            term,
+            self.logic,
+            declarations,
+            self.environment,
+            symbols,
+            symbol_map,
+        )
+
+    def _back_many(self, terms, declarations, symbols, symbol_map):
+        return terms_to_pysmt(
+            terms,
+            self.logic,
+            declarations,
+            self.environment,
+            symbols,
+            symbol_map,
+        )
+
+    def _binary_with_context(self, solver, symbol_manager, a, b):
+        """Compute an interpolant while all native terms share one scope."""
+        (symbol_map, native_formulas, declarations,
+         native_symbols) = self._prepare([a, b])
+        self._run_commands(
+            solver,
+            symbol_manager,
+            declarations,
+            "declarations",
+        )
+        a_term = self._parse_term(solver, symbol_manager, native_formulas[0])
+        b_term = self._parse_term(solver, symbol_manager, native_formulas[1])
+        solver.assertFormula(a_term)
+
+        try:
+            result = solver.checkSatAssuming(b_term)
+        except TypeError:
+            result = solver.checkSatAssuming(*[b_term])
+
+        if result.isSat():
+            return None
+        if result.isUnknown():
+            raise SolverReturnedUnknownResultError()
+
+        not_b = solver.mkTerm(Kind.NOT, b_term)
+        interpolant = solver.getInterpolant(not_b)
+        if interpolant.isNull():
+            raise InternalSolverError("cvc5 did not produce an interpolant")
+        return self._back(interpolant, declarations, native_symbols, symbol_map)
+
+    def binary_interpolant(self, a, b):
+        self._check_logic([a, b])
+        solver, symbol_manager = self._context()
+        try:
+            return self._binary_with_context(
+                solver,
+                symbol_manager,
+                a,
+                b,
+            )
+        finally:
+            # _binary_with_context has already released its local native
+            # terms. The symbol manager must then go before its solver.
+            del symbol_manager
+            del solver
+
+    def sequence_interpolant(self, formulas):
+        formulas = list(formulas)
+        if len(formulas) < 2:
+            raise PysmtValueError("interpolation needs at least 2 formulae")
+        self._check_logic(formulas)
+
+        solver, symbol_manager = self._context()
+        try:
+            return self._sequence_with_context(
+                solver,
+                symbol_manager,
+                formulas,
+            )
+        finally:
+            del symbol_manager
+            del solver
+
+    def _sequence_with_context(self, solver, symbol_manager, formulas):
+        """Build an inductive sequence without mixing native cvc5 scopes."""
+        (symbol_map, native_pysmt_formulas, declarations,
+         native_symbols) = self._prepare(formulas)
+        self._run_commands(
+            solver,
+            symbol_manager,
+            declarations,
+            "declarations",
+        )
+        native_formulas = [
+            self._parse_term(solver, symbol_manager, formula)
+            for formula in native_pysmt_formulas
+        ]
+
+        suffixes = [None] * len(native_formulas)
+        suffixes[-1] = native_formulas[-1]
+        for index in range(len(native_formulas) - 2, -1, -1):
+            suffixes[index] = solver.mkTerm(
+                Kind.AND,
+                native_formulas[index],
+                suffixes[index + 1],
+            )
+
+        native_interpolants = []
+        interpolants = []
+        previous = solver.mkBoolean(True)
+        for index in range(1, len(native_formulas)):
+            solver.resetAssertions()
+            left = solver.mkTerm(
+                Kind.AND,
+                previous,
+                native_formulas[index - 1],
+            )
+            solver.assertFormula(left)
+            right = suffixes[index]
+
+            try:
+                result = solver.checkSatAssuming(right)
+            except TypeError:
+                result = solver.checkSatAssuming(*[right])
+
+            if result.isSat():
+                return None
+            if result.isUnknown():
+                raise SolverReturnedUnknownResultError()
+
+            not_right = solver.mkTerm(Kind.NOT, right)
+            native_interpolant = solver.getInterpolant(not_right)
+            if native_interpolant.isNull():
+                raise InternalSolverError(
+                    "cvc5 did not produce a sequence interpolant"
+                )
+            native_interpolants.append(native_interpolant)
+            previous = native_interpolant
+
+        # Translating back is deferred to here on purpose: the loop only ever
+        # feeds the *native* interpolant forward, so nothing depends on the
+        # pySMT form mid-loop, and one batched parse reads the declaration
+        # block once instead of once per interpolant.
+        interpolants = self._back_many(
+            native_interpolants,
+            declarations,
+            native_symbols,
+            symbol_map,
+        )
+        return interpolants
+
+    def _exit(self):
+        pass
