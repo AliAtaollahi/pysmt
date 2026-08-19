@@ -77,7 +77,8 @@ class TestNonLinear(TestCase):
         # nonlinear arithmetic, not who can represent an algebraic number.
         f = Equals(Times(x, x), Real(4))
         for sname in self.env.factory.all_solvers():
-            if sname in ["bdd", "picosat", "btor"]:
+            if sname in ["bdd", "picosat", "btor", "bitwuzla",
+                         "smtinterpol"]:
                 with Solver(name=sname) as s:
                     with self.assertRaises(ConvertExpressionError):
                         s.is_sat(f)
