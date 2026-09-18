@@ -25,7 +25,7 @@ from pysmt.shortcuts import (Real, Plus, Symbol, Equals, And, Bool, Or, Not,
                              Div, LT, LE, Int, ToReal, Iff, Exists, Times, FALSE,
                              BVLShr, BVLShl, BVAShr, BV, BVAdd, BVULT, BVMul,
                              Select, Array, Ite, String, Function, to_smtlib, ForAll)
-from pysmt.shortcuts import Solver, get_env, qelim, get_model, TRUE, ExactlyOne
+from pysmt.shortcuts import Solver, get_env, qelim, get_model, TRUE, ExactlyOne, Minus
 from pysmt.typing import REAL, BOOL, INT, BVType, FunctionType, ArrayType
 from pysmt.test import (TestCase, skipIfSolverNotAvailable, skipIfNoSolverForLogic,
                         skipIfNoQEForLogic)
@@ -187,15 +187,17 @@ class TestRegressions(TestCase):
         x = Symbol("x", INT)
         y = Symbol("y", INT)
         f = Exists([x], Equals(y, Times(x, Int(2))))
-        with self.assertRaises(ConvertExpressionError):
-            qelim(f)
-
         try:
-            qelim(f)
+            qf = qelim(f)
         except ConvertExpressionError as ex:
             # The modulus operator must be there
             self.assertTrue("%2" in str(ex.expression) or \
                             "int_mod_congr" in str(ex.expression))
+        else:
+            # MathSAT's congruence, y = 0 (mod 2), is converted back as an
+            # integer division by the modulus.
+            even = Equals(Minus(y, Times(Int(2), Div(y, Int(2)))), Int(0))
+            self.assertValid(Iff(qf, even))
 
     @skipIfSolverNotAvailable("msat")
     def test_msat_partial_model(self):

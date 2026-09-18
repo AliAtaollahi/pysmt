@@ -17,7 +17,7 @@
 #
 from pysmt.shortcuts import Symbol, ForAll, Exists, And, Iff, GE, LT, Real, Int
 from pysmt.shortcuts import Minus, Equals, Plus, ToReal, Implies, LE, TRUE, Not
-from pysmt.shortcuts import Times, QuantifierEliminator
+from pysmt.shortcuts import Times, Div, QuantifierEliminator
 from pysmt.shortcuts import is_sat, is_valid
 from pysmt.typing import REAL, BOOL, INT
 from pysmt.test import TestCase, main
@@ -125,7 +125,7 @@ class TestQE(TestCase):
         self._alternation_int_example(qe)
         self._std_examples(qe, LIA)
 
-        self._modular_congruence(qe)
+        self._modular_congruence_converted(qe)
 
         # Additional test for raising error on back conversion of
         # quantified formulae
@@ -141,6 +141,15 @@ class TestQE(TestCase):
         f = Exists([q], Equals(Times(q, Int(2)), p))
         with self.assertRaises(ConvertExpressionError):
             qe.eliminate_quantifiers(f)
+
+    def _modular_congruence_converted(self, qe):
+        # MathSAT eliminates the quantifier into a congruence, p = 0 (mod 2),
+        # which is converted back as an integer division by the modulus.
+        p, q = (Symbol(n, INT) for n in "pq")
+        f = Exists([q], Equals(Times(q, Int(2)), p))
+        qf = qe.eliminate_quantifiers(f)
+        even = Equals(Minus(p, Times(Int(2), Div(p, Int(2)))), Int(0))
+        self.assertValid(Iff(qf, even), solver_name="msat")
 
 
     def _bool_example(self, qe):
